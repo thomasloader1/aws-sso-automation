@@ -30,12 +30,24 @@
   .\scripts\aws-sso.ps1 sql-console
 .EXAMPLE
   .\scripts\aws-sso.ps1 migrate-setup
+.EXAMPLE
+  .\scripts\aws-sso.ps1 db-creds
+.EXAMPLE
+  .\scripts\aws-sso.ps1 db-creds -Environment prd
+.EXAMPLE
+  .\scripts\aws-sso.ps1 s3-creds
+.EXAMPLE
+  .\scripts\aws-sso.ps1 smtp-creds -Environment dev
+.EXAMPLE
+  .\scripts\aws-sso.ps1 smtp-creds -Environment dev -IamSecret "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+.EXAMPLE
+  .\scripts\aws-sso.ps1 smtp-creds -Environment dev -CreateKey
 #>
 
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("list", "status", "login", "use", "db-tunnel", "menu", "discover", "targets", "sql-console", "migrate-setup", "help")]
+    [ValidateSet("list", "status", "login", "use", "db-tunnel", "menu", "discover", "targets", "sql-console", "migrate-setup", "db-creds", "s3-creds", "smtp-creds", "help")]
     [string]$Command = "help",
 
     [Parameter(Position = 1)]
@@ -53,7 +65,13 @@ param(
 
     [string]$DbEngine = "",
 
-    [string]$BastionId = ""
+    [string]$BastionId = "",
+
+    # smtp-creds / s3-creds: crea un access key IAM nuevo y muestra el secret (solo una vez).
+    [switch]$CreateKey,
+
+    # smtp-creds: Secret Access Key IAM -> SMTP password. Si no se pasa, se pide por consola.
+    [string]$IamSecret = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -75,6 +93,18 @@ function Get-AvailableEnvironments {
     return @()
 }
 
+function Get-EnvironmentForProfile {
+    param([string]$ProfileName)
+
+    $envNames = Get-AvailableEnvironments
+    if ($envNames.Count -eq 0 -or -not $ProfileName) { return $null }
+
+    $tokens = @($ProfileName -split '[^a-zA-Z0-9]+')
+    $matches = @($envNames | Where-Object { $tokens -contains $_ })
+    if ($matches.Count -eq 1) { return $matches[0] }
+    return $null
+}
+
 function Set-DevTargetsFromConfig {
     param([string]$EnvName)
 
@@ -88,8 +118,10 @@ function Set-DevTargetsFromConfig {
         }
         elseif ($available.Count -gt 0) {
             $targetConfig = $discovered.Environments.$($available[0])
-            Write-WarnLine ("Ambiente '{0}' no encontrado en {1}. Usando '{2}'." -f $EnvName, $TargetsFile, $available[0])
-            $script:Environment = $available[0]
+            if ($EnvName) {
+                Write-WarnLine ("Ambiente '{0}' no encontrado en {1}. Usando '{2}'." -f $EnvName, $TargetsFile, $available[0])
+                $script:Environment = $available[0]
+            }
         }
     }
     elseif ($discovered -and $discovered.Targets) {
@@ -394,6 +426,9 @@ Uso:
   .\scripts\aws-sso.ps1 targets [-Environment dev|qa|prd]
   .\scripts\aws-sso.ps1 sql-console [-Environment dev|qa|prd] [-AwsProfile P] [-LocalPort N]
   .\scripts\aws-sso.ps1 migrate-setup [-Environment dev|qa|prd] [-AwsProfile P]
+  .\scripts\aws-sso.ps1 db-creds [-Environment dev|prd] [-AwsProfile P]
+  .\scripts\aws-sso.ps1 s3-creds [-Environment dev|prd] [-AwsProfile P] [-CreateKey]
+  .\scripts\aws-sso.ps1 smtp-creds [-Environment dev|prd] [-AwsProfile P] [-IamSecret S] [-CreateKey]
 
 Ejemplos:
   .\scripts\aws-sso.ps1 list
@@ -406,6 +441,13 @@ Ejemplos:
   .\scripts\aws-sso.ps1 targets -Environment prd
   .\scripts\aws-sso.ps1 sql-console -Environment prd -AwsProfile tu-perfil-prd
   .\scripts\aws-sso.ps1 migrate-setup -Environment dev -AwsProfile tu-perfil-dev
+  .\scripts\aws-sso.ps1 db-creds
+  .\scripts\aws-sso.ps1 db-creds -Environment prd
+  .\scripts\aws-sso.ps1 s3-creds
+  .\scripts\aws-sso.ps1 s3-creds -Environment prd
+  .\scripts\aws-sso.ps1 smtp-creds
+  .\scripts\aws-sso.ps1 smtp-creds -Environment dev -IamSecret "tu-secret-iam"
+  .\scripts\aws-sso.ps1 smtp-creds -Environment dev -CreateKey
 
 Notas:
   - use setea AWS_PROFILE solo en la sesion actual de PowerShell.
@@ -431,6 +473,19 @@ Notas:
     locales) o crear uno nuevo. Al final imprime el comando node migrate.js listo
     para copiar. A diferencia de sql-console, el tunnel NO se cierra solo (queda
     corriendo para que migrate-cli lo use) - el comando te muestra como cerrarlo.
+  - db-creds busca en AWS Secrets Manager (perfil resuelto automaticamente por
+    ambiente) los secrets rds-db-credentials/* y rds!cluster-* de RDS, y
+    muestra usuario/password tanto del usuario master/admin como del app_user.
+    Sin -Environment, corre para dev y prd. Requiere permisos IAM de lectura
+    sobre Secrets Manager en la cuenta correspondiente.
+  - s3-creds exporta las credenciales temporales del SSO (AccessKeyId /
+    SecretAccessKey / SessionToken) y lista buckets baycollections*. Con
+    -CreateKey tambien genera un access key del IAM baycollections-importer-app
+    (secret solo visible una vez) para pegar en appsettings AWS.
+  - smtp-creds muestra el endpoint SES SMTP, identidades y AccessKeyId del
+    usuario IAM SMTP-*. Por defecto pide el Secret Access Key IAM por consola
+    y lo convierte a SMTP password (SigV4) sin rotar keys. Tambien podés pasar
+    -IamSecret "..." (scripts) o -CreateKey (genera access key nuevo + convierte).
 "@
 }
 
@@ -656,12 +711,25 @@ function Resolve-LocalPort {
 }
 
 function Invoke-DbTunnel {
-    if (-not $Environment -or [string]::IsNullOrWhiteSpace($Environment)) {
-        $Environment = Select-Environment
-        $script:Environment = $Environment
-    }
     if (-not $AwsProfile -or [string]::IsNullOrWhiteSpace($AwsProfile)) {
         $AwsProfile = Select-AwsProfile
+    }
+    if (-not $Environment -or [string]::IsNullOrWhiteSpace($Environment)) {
+        $inferred = Get-EnvironmentForProfile -ProfileName $AwsProfile
+        if ($inferred) {
+            $Environment = $inferred
+            Write-Info ("Ambiente inferido del perfil '{0}': {1}" -f $AwsProfile, $Environment)
+        }
+        else {
+            $Environment = Select-Environment
+        }
+        $script:Environment = $Environment
+    }
+    else {
+        $inferred = Get-EnvironmentForProfile -ProfileName $AwsProfile
+        if ($inferred -and $inferred -ne $Environment) {
+            Write-WarnLine ("El perfil '{0}' parece ser de '{1}', pero el ambiente elegido es '{2}'. Verifica que sea correcto." -f $AwsProfile, $inferred, $Environment)
+        }
     }
     Set-DevTargetsFromConfig -EnvName $Environment
 
@@ -743,22 +811,6 @@ function Read-MenuChoice {
 }
 
 function Invoke-Menu {
-    if (-not $Environment -or [string]::IsNullOrWhiteSpace($Environment)) {
-        $Environment = Select-Environment
-        $script:Environment = $Environment
-    }
-    else {
-        $availableEnvs = Get-AvailableEnvironments
-        if ($availableEnvs.Count -gt 0 -and $availableEnvs -notcontains $Environment) {
-            Write-WarnLine ("Ambiente '{0}' no existe. Selecciono otro ambiente." -f $Environment)
-            $Environment = Select-Environment
-            $script:Environment = $Environment
-        }
-    }
-
-    Set-DevTargetsFromConfig -EnvName $Environment
-    Write-Info ("Ambiente: {0}" -f $Environment)
-
     $profiles = Get-AwsConfigProfiles
     if ($profiles.Count -eq 0) {
         Write-WarnLine "No se encontraron perfiles SSO en $AwsConfigPath"
@@ -774,6 +826,34 @@ function Invoke-Menu {
     $profileIndex = Read-MenuChoice -Prompt "Elegi un perfil (numero, o 'q' para salir)" -Count $profiles.Count
     if ($null -eq $profileIndex) { return }
     $chosenProfile = $profiles[$profileIndex].Name
+
+    if (-not $Environment -or [string]::IsNullOrWhiteSpace($Environment)) {
+        $inferred = Get-EnvironmentForProfile -ProfileName $chosenProfile
+        if ($inferred) {
+            $Environment = $inferred
+            Write-Info ("Ambiente inferido del perfil '{0}': {1}" -f $chosenProfile, $Environment)
+        }
+        else {
+            $Environment = Select-Environment
+        }
+    }
+    else {
+        $availableEnvs = Get-AvailableEnvironments
+        if ($availableEnvs.Count -gt 0 -and $availableEnvs -notcontains $Environment) {
+            Write-WarnLine ("Ambiente '{0}' no existe. Selecciono otro ambiente." -f $Environment)
+            $Environment = Select-Environment
+        }
+        else {
+            $inferred = Get-EnvironmentForProfile -ProfileName $chosenProfile
+            if ($inferred -and $inferred -ne $Environment) {
+                Write-WarnLine ("El perfil '{0}' parece ser de '{1}', pero el ambiente elegido es '{2}'. Verifica que sea correcto." -f $chosenProfile, $inferred, $Environment)
+            }
+        }
+    }
+    $script:Environment = $Environment
+
+    Set-DevTargetsFromConfig -EnvName $Environment
+    Write-Info ("Ambiente: {0}" -f $Environment)
 
     $engines = @($DevTargets.Keys | Sort-Object)
     Write-Info "Motor de base de datos:"
@@ -803,6 +883,7 @@ function Invoke-Menu {
     $argList = @(
         "-NoExit", "-File", $scriptPath,
         "db-tunnel",
+        "-Environment", $Environment,
         "-AwsProfile", $chosenProfile,
         "-DbEngine", $chosenEngine,
         "-LocalPort", $portToUse
@@ -1499,6 +1580,466 @@ function Invoke-MigrateSetup {
     Write-WarnLine ("El tunnel SSM queda abierto en segundo plano (PID {0}) para que migrate-cli se conecte mientras trabajas. Cerralo cuando termines: Stop-Process -Id {0} -Force" -f $tunnelProc.Id)
 }
 
+function Get-ProfileForEnvironment {
+    param([Parameter(Mandatory)][string]$EnvName)
+
+    $matching = @(Get-AwsConfigProfiles | Where-Object { @($_.Name -split '[^a-zA-Z0-9]+') -contains $EnvName })
+    if ($matching.Count -eq 1) { return $matching[0].Name }
+    return $null
+}
+
+function Confirm-ProfileAuth {
+    param([Parameter(Mandatory)][string]$Name)
+
+    $auth = Get-ProfileAuthStatus -Name $Name
+    if ($auth.Status -ne "ok") {
+        Write-WarnLine ("Perfil '{0}' no autenticado. Iniciando login..." -f $Name)
+        & aws sso login --profile $Name
+        if ($LASTEXITCODE -ne 0) { throw ("No se pudo autenticar {0}" -f $Name) }
+    }
+}
+
+function Get-DbCredsForProfile {
+    param(
+        [Parameter(Mandatory)][string]$ProfileName,
+        [string]$Region = "us-east-1"
+    )
+
+    $listResp = Invoke-Aws secretsmanager list-secrets --profile $ProfileName --region $Region `
+        --query "SecretList[].Name" --output text
+    if ($listResp.ExitCode -ne 0) {
+        Write-ErrLine ("No se pudo listar secrets: {0}" -f $listResp.Output)
+        return @()
+    }
+
+    # --output text separado por tabs (una linea por pagina, no por secret);
+    # partimos por cualquier whitespace para no depender de reparsear JSON
+    # multilinea, que en esta consola a veces colapsa el array (ver notas).
+    $names = @($listResp.Output -split '[\r\n\t]+' | Where-Object { $_ -and $_.Trim() } | ForEach-Object { $_.Trim() })
+    $dbSecretNames = @($names | Where-Object { $_ -match '^rds[!-]' })
+
+    $rows = @()
+    foreach ($name in $dbSecretNames) {
+        $valResp = Invoke-Aws secretsmanager get-secret-value --profile $ProfileName --region $Region `
+            --secret-id $name --query SecretString --output text
+        if ($valResp.ExitCode -ne 0) {
+            Write-WarnLine ("No se pudo leer secret '{0}': {1}" -f $name, $valResp.Output)
+            continue
+        }
+
+        try {
+            $parsed = $valResp.Output.Trim() | ConvertFrom-Json
+        }
+        catch {
+            continue
+        }
+
+        if ($parsed.username -and $parsed.password) {
+            $rows += [pscustomobject]@{
+                Secret   = $name
+                Rol      = "master"
+                Usuario  = $parsed.username
+                Password = $parsed.password
+                Engine   = $parsed.engine
+                Host     = $parsed.host
+            }
+        }
+        if ($parsed.new_app_username -and $parsed.new_app_password) {
+            $rows += [pscustomobject]@{
+                Secret   = $name
+                Rol      = "app_user"
+                Usuario  = $parsed.new_app_username
+                Password = $parsed.new_app_password
+                Engine   = $parsed.engine
+                Host     = $parsed.host
+            }
+        }
+    }
+    return $rows
+}
+
+function Invoke-DbCreds {
+    $envNames = @("dev", "prd")
+    if ($Environment -and -not [string]::IsNullOrWhiteSpace($Environment)) {
+        $envNames = @($Environment.Trim())
+    }
+
+    foreach ($envName in $envNames) {
+        Write-Info ("=== Ambiente: {0} ===" -f $envName.ToUpper())
+
+        $profileName = $null
+        if ($envNames.Count -eq 1 -and $AwsProfile -and -not [string]::IsNullOrWhiteSpace($AwsProfile)) {
+            $profileName = $AwsProfile
+        }
+        else {
+            $profileName = Get-ProfileForEnvironment -EnvName $envName
+        }
+
+        if (-not $profileName) {
+            Write-WarnLine ("No se encontro (o es ambiguo) un perfil SSO para el ambiente '{0}'. Usa -AwsProfile para indicarlo." -f $envName)
+            continue
+        }
+
+        try {
+            Confirm-ProfileAuth -Name $profileName
+        }
+        catch {
+            Write-ErrLine $_.Exception.Message
+            continue
+        }
+
+        $rows = Get-DbCredsForProfile -ProfileName $profileName
+        if ($rows.Count -eq 0) {
+            Write-WarnLine ("No se encontraron credenciales de DB en Secrets Manager (perfil {0})." -f $profileName)
+            Write-Host ""
+            continue
+        }
+        $rows | Format-Table -AutoSize -Wrap
+        Write-Host ""
+    }
+}
+
+function Convert-IamSecretToSesSmtpPassword {
+    param(
+        [Parameter(Mandatory)][string]$IamSecret,
+        [string]$Region = "us-east-1"
+    )
+
+    function Get-HmacSha256([byte[]]$KeyBytes, [string]$Message) {
+        $hmac = [System.Security.Cryptography.HMACSHA256]::new($KeyBytes)
+        try {
+            return $hmac.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Message))
+        }
+        finally {
+            $hmac.Dispose()
+        }
+    }
+
+    $kDate = Get-HmacSha256 ([System.Text.Encoding]::UTF8.GetBytes("AWS4$IamSecret")) "11111111"
+    $kRegion = Get-HmacSha256 $kDate $Region
+    $kService = Get-HmacSha256 $kRegion "ses"
+    $kSigning = Get-HmacSha256 $kService "aws4_request"
+    $signature = Get-HmacSha256 $kSigning "SendRawEmail"
+    $versioned = New-Object byte[] ($signature.Length + 1)
+    $versioned[0] = 0x04
+    [Array]::Copy($signature, 0, $versioned, 1, $signature.Length)
+    return [Convert]::ToBase64String($versioned)
+}
+
+function Invoke-CredsForEnvironments {
+    param(
+        [Parameter(Mandatory)][scriptblock]$Fetcher,
+        [string]$EmptyMessage = "No se encontraron datos."
+    )
+
+    $envNames = @("dev", "prd")
+    if ($Environment -and -not [string]::IsNullOrWhiteSpace($Environment)) {
+        $envNames = @($Environment.Trim())
+    }
+
+    foreach ($envName in $envNames) {
+        Write-Info ("=== Ambiente: {0} ===" -f $envName.ToUpper())
+
+        $profileName = $null
+        if ($envNames.Count -eq 1 -and $AwsProfile -and -not [string]::IsNullOrWhiteSpace($AwsProfile)) {
+            $profileName = $AwsProfile
+        }
+        else {
+            $profileName = Get-ProfileForEnvironment -EnvName $envName
+        }
+
+        if (-not $profileName) {
+            Write-WarnLine ("No se encontro (o es ambiguo) un perfil SSO para el ambiente '{0}'. Usa -AwsProfile para indicarlo." -f $envName)
+            continue
+        }
+
+        try {
+            Confirm-ProfileAuth -Name $profileName
+        }
+        catch {
+            Write-ErrLine $_.Exception.Message
+            continue
+        }
+
+        Write-Host ("Perfil: {0}" -f $profileName) -ForegroundColor DarkGray
+        $result = & $Fetcher $profileName
+        if (-not $result) {
+            Write-WarnLine ($EmptyMessage -f $profileName)
+            Write-Host ""
+            continue
+        }
+
+        if ($result -is [System.Collections.IDictionary]) {
+            foreach ($key in @($result.Keys)) {
+                $rows = @($result[$key])
+                if ($rows.Count -eq 0) { continue }
+                Write-Host $key -ForegroundColor Cyan
+                $rows | Format-Table -AutoSize -Wrap
+                Write-Host ""
+            }
+        }
+        else {
+            @($result) | Format-Table -AutoSize -Wrap
+            Write-Host ""
+        }
+    }
+}
+
+function New-IamAccessKeyForUser {
+    param(
+        [Parameter(Mandatory)][string]$ProfileName,
+        [Parameter(Mandatory)][string]$UserName
+    )
+
+    $keysResp = Invoke-Aws iam list-access-keys --profile $ProfileName --user-name $UserName --output json
+    if ($keysResp.ExitCode -ne 0) {
+        Write-WarnLine ("No se pudieron listar access keys de '{0}': {1}" -f $UserName, $keysResp.Output.Trim())
+        return $null
+    }
+
+    try {
+        $existing = @(($keysResp.Output | ConvertFrom-Json).AccessKeyMetadata)
+    }
+    catch {
+        Write-WarnLine ("No se pudo parsear access keys de '{0}'." -f $UserName)
+        return $null
+    }
+
+    if ($existing.Count -ge 2) {
+        Write-WarnLine ("El usuario IAM '{0}' ya tiene 2 access keys. Borrá una en IAM y reintentá con -CreateKey." -f $UserName)
+        return $null
+    }
+
+    $createResp = Invoke-Aws iam create-access-key --profile $ProfileName --user-name $UserName --output json
+    if ($createResp.ExitCode -ne 0) {
+        Write-WarnLine ("No se pudo crear access key para '{0}': {1}" -f $UserName, $createResp.Output.Trim())
+        return $null
+    }
+
+    try {
+        return ($createResp.Output | ConvertFrom-Json).AccessKey
+    }
+    catch {
+        Write-WarnLine ("Access key creado pero no se pudo parsear la respuesta de '{0}'." -f $UserName)
+        return $null
+    }
+}
+
+function Get-S3CredsForProfile {
+    param(
+        [Parameter(Mandatory)][string]$ProfileName,
+        [string]$Region = "us-east-1"
+    )
+
+    $sessionRows = @()
+    $exportResp = Invoke-Aws configure export-credentials --profile $ProfileName
+    if ($exportResp.ExitCode -eq 0) {
+        try {
+            $cred = $exportResp.Output.Trim() | ConvertFrom-Json
+            $sessionRows += [pscustomobject]@{
+                Tipo          = "SSO (temporal)"
+                AccessKeyId   = $cred.AccessKeyId
+                SecretAccessKey = $cred.SecretAccessKey
+                SessionToken  = $cred.SessionToken
+                Expiration    = $cred.Expiration
+                Region        = $Region
+            }
+        }
+        catch {
+            Write-WarnLine "No se pudieron parsear las credenciales SSO exportadas."
+        }
+    }
+    else {
+        Write-WarnLine ("No se pudieron exportar credenciales SSO: {0}" -f $exportResp.Output.Trim())
+    }
+
+    $iamRows = @()
+    $importer = "baycollections-importer-app"
+    $keysResp = Invoke-Aws iam list-access-keys --profile $ProfileName --user-name $importer --output json
+    if ($keysResp.ExitCode -eq 0) {
+        try {
+            $keys = @(($keysResp.Output | ConvertFrom-Json).AccessKeyMetadata)
+            foreach ($k in $keys) {
+                $iamRows += [pscustomobject]@{
+                    Tipo            = "IAM appsettings"
+                    IamUser         = $importer
+                    AccessKeyId     = $k.AccessKeyId
+                    SecretAccessKey = "(no recuperable; usa -CreateKey)"
+                    Status          = $k.Status
+                    CreateDate      = $k.CreateDate
+                    Region          = $Region
+                }
+            }
+        }
+        catch { }
+    }
+
+    if ($CreateKey) {
+        $created = New-IamAccessKeyForUser -ProfileName $ProfileName -UserName $importer
+        if ($created) {
+            $iamRows += [pscustomobject]@{
+                Tipo            = "IAM NUEVO (guardar ya)"
+                IamUser         = $importer
+                AccessKeyId     = $created.AccessKeyId
+                SecretAccessKey = $created.SecretAccessKey
+                Status          = $created.Status
+                CreateDate      = $created.CreateDate
+                Region          = $Region
+            }
+        }
+    }
+
+    $bucketRows = @()
+    $bucketsResp = Invoke-Aws s3api list-buckets --profile $ProfileName --output json
+    if ($bucketsResp.ExitCode -eq 0) {
+        try {
+            $all = @(($bucketsResp.Output | ConvertFrom-Json).Buckets)
+            foreach ($b in ($all | Where-Object { $_.Name -match 'baycollections' })) {
+                $bucketRows += [pscustomobject]@{
+                    Bucket       = $b.Name
+                    CreationDate = $b.CreationDate
+                    Region       = $Region
+                }
+            }
+        }
+        catch {
+            Write-WarnLine "No se pudo parsear la lista de buckets."
+        }
+    }
+    else {
+        Write-WarnLine ("No se pudieron listar buckets: {0}" -f $bucketsResp.Output.Trim())
+    }
+
+    return [ordered]@{
+        "Credenciales SSO (usar ya / CLI-SDK)" = $sessionRows
+        "IAM baycollections-importer-app (appsettings AWS)" = $iamRows
+        "Buckets baycollections*" = $bucketRows
+    }
+}
+
+function Get-SmtpCredsForProfile {
+    param(
+        [Parameter(Mandatory)][string]$ProfileName,
+        [string]$Region = "us-east-1"
+    )
+
+    $smtpHost = "email-smtp.$Region.amazonaws.com"
+    $smtpPort = 587
+
+    $identities = @()
+    $idResp = Invoke-Aws ses list-identities --profile $ProfileName --region $Region --output json
+    if ($idResp.ExitCode -eq 0) {
+        try {
+            $identities = @(($idResp.Output | ConvertFrom-Json).Identities)
+        }
+        catch { }
+    }
+    $identityText = if ($identities.Count -gt 0) { ($identities -join ", ") } else { "(sin identidades listadas)" }
+
+    $usersResp = Invoke-Aws iam list-users --profile $ProfileName --output json
+    if ($usersResp.ExitCode -ne 0) {
+        Write-WarnLine ("No se pudieron listar usuarios IAM: {0}" -f $usersResp.Output.Trim())
+        return @()
+    }
+
+    try {
+        $smtpUsers = @(($usersResp.Output | ConvertFrom-Json).Users | Where-Object { $_.UserName -match '^SMTP-' })
+    }
+    catch {
+        Write-WarnLine "No se pudo parsear la lista de usuarios IAM."
+        return @()
+    }
+
+    if ($smtpUsers.Count -eq 0) {
+        return @()
+    }
+
+    $derivedSmtpPassword = $null
+    if ($IamSecret -and -not [string]::IsNullOrWhiteSpace($IamSecret)) {
+        $derivedSmtpPassword = Convert-IamSecretToSesSmtpPassword -IamSecret $IamSecret.Trim() -Region $Region
+        Write-Ok ("SMTP password derivada (región {0}). Usala con el AccessKeyId dueño de ese secret." -f $Region)
+    }
+
+    $rows = @()
+    foreach ($user in $smtpUsers) {
+        $keysResp = Invoke-Aws iam list-access-keys --profile $ProfileName --user-name $user.UserName --output json
+        $keys = @()
+        if ($keysResp.ExitCode -eq 0) {
+            try { $keys = @(($keysResp.Output | ConvertFrom-Json).AccessKeyMetadata) } catch { }
+        }
+
+        $secretForConvert = if ($IamSecret) { $IamSecret.Trim() } else { $null }
+
+        if ($keys.Count -eq 0) {
+            $rows += [pscustomobject]@{
+                IamUser      = $user.UserName
+                SMTPHost     = $smtpHost
+                SMTPPort     = $smtpPort
+                Username     = "(sin access key)"
+                SmtpPassword = $(if ($derivedSmtpPassword) { $derivedSmtpPassword } else { "(sin conversion)" })
+                Status       = ""
+                Identities   = $identityText
+            }
+        }
+        else {
+            foreach ($k in $keys) {
+                $row = [pscustomobject]@{
+                    IamUser      = $user.UserName
+                    SMTPHost     = $smtpHost
+                    SMTPPort     = $smtpPort
+                    Username     = $k.AccessKeyId
+                    SmtpPassword = $(if ($derivedSmtpPassword) { $derivedSmtpPassword } else { "(sin conversion)" })
+                    Status       = $k.Status
+                    Identities   = $identityText
+                }
+                if ($secretForConvert) {
+                    $row | Add-Member -NotePropertyName IamSecret -NotePropertyValue $secretForConvert
+                }
+                $rows += $row
+            }
+        }
+
+        if ($CreateKey) {
+            $created = New-IamAccessKeyForUser -ProfileName $ProfileName -UserName $user.UserName
+            if ($created) {
+                $smtpPassword = Convert-IamSecretToSesSmtpPassword -IamSecret $created.SecretAccessKey -Region $Region
+                $rows += [pscustomobject]@{
+                    IamUser      = $user.UserName
+                    SMTPHost     = $smtpHost
+                    SMTPPort     = $smtpPort
+                    Username     = $created.AccessKeyId
+                    SmtpPassword = $smtpPassword
+                    IamSecret    = $created.SecretAccessKey
+                    Status       = "NUEVO (guardar SmtpPassword en MailSettings)"
+                    Identities   = $identityText
+                }
+            }
+        }
+    }
+
+    return $rows
+}
+
+function Invoke-S3Creds {
+    Invoke-CredsForEnvironments -Fetcher { param($p) Get-S3CredsForProfile -ProfileName $p } `
+        -EmptyMessage "No se encontraron datos de S3 (perfil {0})."
+}
+
+function Invoke-SmtpCreds {
+    if ((-not $IamSecret -or [string]::IsNullOrWhiteSpace($IamSecret)) -and -not $CreateKey) {
+        Write-WarnLine "AWS no recupera el Secret IAM de una key existente."
+        Write-Host "Pegá el Secret Access Key IAM para convertirlo a SMTP password (MailSettings:Password)." -ForegroundColor DarkGray
+        Write-Host "Enter omite la conversion (solo lista Username/host)." -ForegroundColor DarkGray
+        $typed = Read-Host "Secret Access Key IAM"
+        if ($typed -and -not [string]::IsNullOrWhiteSpace($typed)) {
+            $script:IamSecret = $typed.Trim()
+        }
+    }
+
+    Invoke-CredsForEnvironments -Fetcher { param($p) Get-SmtpCredsForProfile -ProfileName $p } `
+        -EmptyMessage "No se encontro usuario IAM SMTP-* (perfil {0})."
+}
+
 Test-AwsCli
 
 switch ($Command) {
@@ -1512,5 +2053,8 @@ switch ($Command) {
     "targets"     { Invoke-Targets }
     "sql-console"   { Invoke-SqlConsole }
     "migrate-setup" { Invoke-MigrateSetup }
+    "db-creds"      { Invoke-DbCreds }
+    "s3-creds"      { Invoke-S3Creds }
+    "smtp-creds"    { Invoke-SmtpCreds }
     default         { Show-Help }
 }

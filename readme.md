@@ -64,7 +64,10 @@ Desde la carpeta donde está el script:
 | `status` | Muestra si cada perfil está autenticado, expirado o con error |
 | `login` | Inicia el flujo de login SSO para perfiles seleccionados |
 | `use` | Establece `AWS_PROFILE` en la sesión actual |
-| `db-tunnel` | Abre un túnel local SSM hacia un host remoto |
+| `db-tunnel` | Abre un túnel local SSM a una base de datos remota |
+| `db-creds` | Muestra usuario/password de RDS desde Secrets Manager |
+| `s3-creds` | Muestra credenciales SSO temporales + buckets baycollections* |
+| `smtp-creds` | Lista SES SMTP; por defecto pide el Secret IAM y lo convierte a password SMTP (sin rotar keys) |
 | `help` | Muestra ayuda básica |
 
 ### `list`
